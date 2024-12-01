@@ -1,80 +1,42 @@
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 import json
 import os
-from utils import VideoDownloader, createDir, clearFolder
+from utils import VideoDownloader
 import jiocine
 import logging
-import time
-import asyncio
 import xmltodict
 
-# Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Basic logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-logging.getLogger('httpx').setLevel(logging.WARNING)
 
-# Initialize downloader
+# Load config
+with open('config.json', 'r') as f:
+    config = json.load(f)
+
+# Initialize
+app = Client("jiocinema_bot", api_id=config['api_id'], api_hash=config['api_hash'], bot_token=config['bot_token'])
 downloader = VideoDownloader()
-
-def load_config():
-    try:
-        with open('config.json', 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"Failed to load config: {e}")
-        return {}
-
-config = load_config()
-
-# Initialize Pyrogram client
-app = Client(
-    "jiocinema_bot",
-    api_id=config.get('api_id'),
-    api_hash=config.get('api_hash'),
-    bot_token=config.get('bot_token')
-)
-
-# Store user data
 user_data = {}
 
-def is_authorized(user_id):
-    allowed_users = config.get('allowed_users', [])
-    return not allowed_users or user_id in allowed_users
-
 @app.on_message(filters.command("start"))
-async def start_command(client, message):
-    if not is_authorized(message.from_user.id):
-        await message.reply_text("You are not authorized to use this bot.")
-        return
-
-    await message.reply_text(
-        "Hi! I'm JioCinema Downloader Bot\n\n"
-        "Send me a JioCinema URL using /dl command\n"
-        "Example: /dl https://www.jiocinema.com/movies/xyz/123456"
-    )
+async def start_command(_, message):
+    await message.reply_text("Send me a JioCinema URL using /dl command\nExample: /dl https://www.jiocinema.com/movies/xyz")
 
 @app.on_message(filters.command("dl"))
 async def download_command(client, message):
-    if not is_authorized(message.from_user.id):
-        await message.reply_text("You are not authorized to use this bot.")
-        return
-
     try:
-        # Extract URL from command
         args = message.text.split()
         if len(args) < 2:
             await message.reply_text("Please provide a JioCinema URL!\nExample: /dl [URL]")
             return
         
         url = args[1]
-        msg = await message.reply_text("Processing URL...")
+        msg = await message.reply_text("🔍 Processing URL...")
 
         if "jiocinema.com" not in url:
-            await msg.edit_text("Please provide a valid JioCinema URL!")
+            await msg.edit_text("❌ Please provide a valid JioCinema URL!")
             return
 
         content_id = url.split('/')[-1]
@@ -82,114 +44,111 @@ async def download_command(client, message):
         # Get content details
         content_data = jiocine.getContentDetails(content_id)
         if not content_data:
-            await msg.edit_text("Failed to get content details!")
+            await msg.edit_text("❌ Failed to get content details! Please check URL.")
             return
 
-        # Get playback data
-        content_playback = jiocine.fetchPlaybackData(content_id, config.get("authToken", ""))
-        
-        if not content_playback:
-            token = jiocine.fetchGuestToken()
-            if token:
-                config["authToken"] = token
-                with open('config.json', 'w') as f:
-                    json.dump(config, f, indent=4)
-                content_playback = jiocine.fetchPlaybackData(content_id, token)
-            
-            if not content_playback:
-                await msg.edit_text("Failed to get playback data!")
-                return
+        # Get token and playback data
+        token = jiocine.fetchGuestToken()
+        if not token:
+            await msg.edit_text("❌ Failed to get access token!")
+            return
 
-        # Store data for later use
+        content_playback = jiocine.fetchPlaybackData(content_id, token)
+        if not content_playback:
+            await msg.edit_text("❌ Failed to get playback data!")
+            return
+
+        # Store data
         user_id = message.from_user.id
-        if user_id not in user_data:
-            user_data[user_id] = {}
-        
-        user_data[user_id].update({
+        user_data[user_id] = {
             'content_data': content_data,
             'content_playback': content_playback,
+            'token': token,
             'selected_audio': []
-        })
+        }
 
-        # Get available qualities
+        # Get MPD URL and parse
         mpd_url = None
         for url_data in content_playback.get('playbackUrls', []):
             if url_data.get('streamtype') == 'dash':
                 mpd_url = url_data.get('url')
                 break
 
-        if mpd_url:
-            mpd_data = jiocine.getMPDData(mpd_url)
-            qualities = []
-            audio_tracks = []
-            
-            if mpd_data and 'MPD' in mpd_data:
-                period = mpd_data['MPD']['Period']
-                adaptation_sets = period.get('AdaptationSet', [])
-                if not isinstance(adaptation_sets, list):
-                    adaptation_sets = [adaptation_sets]
-                
-                # Get video qualities
-                for adaptation_set in adaptation_sets:
-                    if isinstance(adaptation_set, dict):
-                        mime_type = adaptation_set.get('@mimeType', '')
-                        
-                        if mime_type.startswith('video/'):
-                            representations = adaptation_set.get('Representation', [])
-                            if not isinstance(representations, list):
-                                representations = [representations]
-                                
-                            for rep in representations:
-                                height = rep.get('@height')
-                                bandwidth = rep.get('@bandwidth')
-                                if height and bandwidth:
-                                    bitrate_mbps = round(int(bandwidth) / 1000000, 1)
-                                    qualities.append({
-                                        'height': int(height),
-                                        'bitrate': bitrate_mbps
-                                    })
-                        
-                        elif mime_type.startswith('audio/'):
-                            lang = adaptation_set.get('@lang')
-                            channels = int(adaptation_set.get('@audioChannelConfiguration', {}).get('@value', 2))
-                            if lang:
-                                audio_tracks.append({
-                                    'id': adaptation_set.get('@id', ''),
-                                    'language': jiocine.LANG_MAP.get(lang, lang),
-                                    'channels': channels,
-                                    'codec': adaptation_set.get('@codecs', 'AAC'),
-                                    'bitrate': round(int(adaptation_set.get('Representation', [{}])[0].get('@bandwidth', 0)) / 1000)
-                                })
+        if not mpd_url:
+            await msg.edit_text("❌ No valid playback URL found!")
+            return
 
-                # Sort qualities by height
-                qualities.sort(key=lambda x: (x['height'], x['bitrate']), reverse=True)
-                
-                # Store audio tracks
-                user_data[user_id]['audio_tracks'] = audio_tracks
-                
-                # Create quality selection buttons
-                keyboard = []
-                for quality in qualities:
-                    keyboard.append([
-                        InlineKeyboardButton(
-                            text=f"{quality['height']}p ({quality['bitrate']} Mbps)",
-                            callback_data=f"quality_{quality['height']}_{quality['bitrate']}"
-                        )
-                    ])
+        mpd_data = jiocine.getMPDData(mpd_url)
+        if not mpd_data or 'MPD' not in mpd_data:
+            await msg.edit_text("❌ Failed to parse video data!")
+            return
 
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await msg.edit_text(
-                    f"🎬 {content_data.get('name', 'Video')}\n\n"
-                    "Select Video Quality:",
-                    reply_markup=reply_markup
+        # Parse qualities and audio tracks
+        period = mpd_data['MPD']['Period']
+        adaptation_sets = period.get('AdaptationSet', [])
+        if not isinstance(adaptation_sets, list):
+            adaptation_sets = [adaptation_sets]
+
+        qualities = []
+        audio_tracks = []
+
+        for adaptation_set in adaptation_sets:
+            if isinstance(adaptation_set, dict):
+                mime_type = adaptation_set.get('@mimeType', '')
+                
+                if mime_type.startswith('video/'):
+                    representations = adaptation_set.get('Representation', [])
+                    if not isinstance(representations, list):
+                        representations = [representations]
+                    
+                    for rep in representations:
+                        height = rep.get('@height')
+                        bandwidth = rep.get('@bandwidth')
+                        if height and bandwidth:
+                            bitrate_mbps = round(int(bandwidth) / 1000000, 1)
+                            qualities.append({
+                                'height': int(height),
+                                'bitrate': bitrate_mbps
+                            })
+                
+                elif mime_type.startswith('audio/'):
+                    lang = adaptation_set.get('@lang')
+                    if lang:
+                        lang_name = jiocine.LANG_MAP.get(lang, lang)
+                        audio_tracks.append({
+                            'id': adaptation_set.get('@id', ''),
+                            'language': lang_name,
+                            'channels': int(adaptation_set.get('@audioChannelConfiguration', {}).get('@value', 2)),
+                            'codec': adaptation_set.get('@codecs', 'AAC'),
+                            'bitrate': round(int(adaptation_set.get('Representation', [{}])[0].get('@bandwidth', 0)) / 1000)
+                        })
+
+        # Sort qualities
+        qualities.sort(key=lambda x: (x['height'], x['bitrate']), reverse=True)
+        
+        # Store audio tracks
+        user_data[user_id]['audio_tracks'] = audio_tracks
+
+        # Create quality selection buttons
+        keyboard = []
+        for quality in qualities:
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"{quality['height']}p ({quality['bitrate']} Mbps)",
+                    callback_data=f"quality_{quality['height']}_{quality['bitrate']}"
                 )
-                return
+            ])
 
-            await msg.edit_text("No video qualities found!")
-            
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await msg.edit_text(
+            f"🎬 {content_data.get('name', 'Video')}\n\n"
+            "Select Video Quality:",
+            reply_markup=reply_markup
+        )
+
     except Exception as e:
         logger.error(f"Error: {str(e)}")
-        await msg.edit_text(f"Error occurred: {str(e)}")
+        await msg.edit_text("❌ An error occurred! Please try again.")
 
 @app.on_callback_query()
 async def button_callback(client, callback_query):
@@ -201,8 +160,6 @@ async def button_callback(client, callback_query):
         if action == "quality":
             height = data[1]
             bitrate = float(data[2])
-            if user_id not in user_data:
-                user_data[user_id] = {}
             user_data[user_id]['quality'] = height
             user_data[user_id]['bitrate'] = bitrate
             
@@ -283,7 +240,7 @@ async def button_callback(client, callback_query):
                 
     except Exception as e:
         logger.error(f"Button callback error: {str(e)}")
-        await callback_query.message.edit_text("An error occurred. Please try again with /dl command")
+        await callback_query.message.edit_text("❌ An error occurred. Please try again with /dl command")
 
 async def start_download(client, callback_query):
     message = await callback_query.message.reply_text("Starting download...")
@@ -294,15 +251,14 @@ async def start_download(client, callback_query):
         content_playback = user_data[user_id].get('content_playback')
         selected_quality = user_data[user_id].get('quality')
         selected_audio = user_data[user_id].get('selected_audio', [])
+        token = user_data[user_id].get('token')
         
-        if not all([content_data, content_playback, selected_quality, selected_audio]):
-            await message.edit_text("Missing download information. Please try again!")
+        if not all([content_data, content_playback, selected_quality, selected_audio, token]):
+            await message.edit_text("❌ Missing download information. Please try again!")
             return
 
-        # Get content title
+        # Get content title and MPD URL
         content_title = content_data.get('name', 'video').replace(' ', '.').replace('/', '-')
-        
-        # Get MPD URL
         mpd_url = None
         for url_data in content_playback.get('playbackUrls', []):
             if url_data.get('streamtype') == 'dash':
@@ -310,7 +266,7 @@ async def start_download(client, callback_query):
                 break
                 
         if not mpd_url:
-            await message.edit_text("No valid playback URL found!")
+            await message.edit_text("❌ No valid playback URL found!")
             return
             
         await message.edit_text("⬇️ Starting download...")
@@ -329,9 +285,7 @@ async def start_download(client, callback_query):
             message=message,
             content_title=content_title,
             selected_languages=selected_languages,
-            ytdlp_path=config.get('ytdlpPath', './bin/yt-dlp'),
-            ffmpeg_path=config.get('ffmpegPath', './bin/ffmpeg'),
-            mp4decrypt_path=config.get('mp4decPath', './bin/mp4decrypt')
+            token=token
         )
         
         if output_file and os.path.exists(output_file):
@@ -362,7 +316,7 @@ async def start_download(client, callback_query):
         logger.error(f"Download error: {str(e)}")
         await message.edit_text(f"❌ Download failed: {str(e)}")
 
-async def progress_callback(current, total, message: Message):
+async def progress_callback(current, total, message):
     try:
         percent = current * 100 / total
         await message.edit_text(
