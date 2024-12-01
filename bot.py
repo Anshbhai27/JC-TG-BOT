@@ -21,26 +21,29 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 downloader = VideoDownloader()
 
 def load_config():
-    with open('config.json', 'r') as f:
-        return json.load(f)
+    try:
+        with open('config.json', 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        return {}
 
 config = load_config()
 
 # Initialize Pyrogram client
 app = Client(
     "jiocinema_bot",
-    api_id=config['api_id'],
-    api_hash=config['api_hash'],
-    bot_token=config['bot_token']
+    api_id=config.get('api_id'),
+    api_hash=config.get('api_hash'),
+    bot_token=config.get('bot_token')
 )
 
 # Store user data
 user_data = {}
 
 def is_authorized(user_id):
-    if not config.get('allowed_users'):
-        return True
-    return user_id in config['allowed_users']
+    allowed_users = config.get('allowed_users', [])
+    return not allowed_users or user_id in allowed_users
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
@@ -378,14 +381,12 @@ def format_size(size):
     return f"{size:.2f} TB"
 
 def main():
-    required_configs = ['api_id', 'api_hash', 'bot_token']
-    missing_configs = [config for config in required_configs if not config.get(config)]
-    
-    if missing_configs:
-        logger.error(f"Missing configurations: {', '.join(missing_configs)}")
-        print("Please check config.json for missing configurations")
+    # Check if required configs exist
+    if not all(key in config for key in ['api_id', 'api_hash', 'bot_token']):
+        print("Missing required configurations in config.json")
+        print("Please ensure api_id, api_hash, and bot_token are set")
         return
-
+    
     logger.info("Bot started successfully")
     print("Bot started! Press Ctrl+C to stop.")
     app.run()
